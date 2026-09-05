@@ -233,6 +233,14 @@ npm run regenerate     # downloads spec, generates tools, builds, and tests
 
 Please open an issue before submitting a larger change so we can discuss the approach. Pull requests should include a description of what changed and why.
 
+### Releasing
+
+Releases are automated by [`.github/workflows/release.yml`](.github/workflows/release.yml):
+
+1. Bump `"version"` in `package.json` and commit it to `main`.
+2. Tag the commit and push the tag: `git tag vX.Y.Z && git push origin vX.Y.Z`.
+3. The workflow builds, tests, and packages the release ZIP, then publishes a GitHub Release for the tag with notes auto-generated from the pull requests merged since the previous tag (from the start of the history for the first release).
+
 ---
 
 ## Acknowledgements
