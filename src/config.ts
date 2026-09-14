@@ -14,6 +14,7 @@
  */
 
 import { AsyncLocalStorage } from 'node:async_hooks';
+import { createHash } from 'node:crypto';
 import dotenv from 'dotenv';
 
 // Load environment variables from .env file
@@ -64,6 +65,40 @@ export const requestBearerToken = new AsyncLocalStorage<string>();
  */
 export function getBearerToken(): string | undefined {
   return requestBearerToken.getStore() ?? process.env.BEARER_TOKEN;
+}
+
+/**
+ * Get the Bearer token for a named OpenAPI security scheme.
+ *
+ * The token of the current request always wins: a `BEARER_TOKEN_<SCHEME>`
+ * variable left in the environment must never silently take over an HTTP
+ * request and make it act as somebody else in Polarion's audit trail. The
+ * scheme-specific variable is a fallback for credential-holding modes (stdio,
+ * REST wrapper) only.
+ *
+ * @param schemeName - Security scheme name from the OpenAPI document.
+ * @returns The bearer token if available, undefined otherwise
+ */
+export function getBearerTokenForScheme(schemeName: string): string | undefined {
+  const requestToken = requestBearerToken.getStore();
+  if (requestToken) return requestToken;
+  const envName = `BEARER_TOKEN_${schemeName.replace(/[^a-zA-Z0-9]/g, '_').toUpperCase()}`;
+  return process.env[envName] || process.env.BEARER_TOKEN;
+}
+
+/**
+ * Fingerprint of the identity behind the current request, for cache keys.
+ *
+ * Caches that hold data fetched from Polarion must be keyed by *who* fetched
+ * it. Different callers have different permissions, so a shared entry would
+ * hand user B data that Polarion only authorized for user A. The token itself
+ * never appears in the key.
+ *
+ * @returns A short, stable, non-reversible id of the current caller.
+ */
+export function callerCacheScope(): string {
+  const token = getBearerToken();
+  return token ? createHash('sha256').update(token).digest('hex').slice(0, 16) : 'no-token';
 }
 
 /**

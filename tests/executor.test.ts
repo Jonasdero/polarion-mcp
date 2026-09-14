@@ -1443,3 +1443,32 @@ test("executeApiTool authenticates with the token of the current request, not th
     else process.env.BEARER_TOKEN = previous
   }
 })
+
+test("executeApiTool does not let a BEARER_TOKEN_<SCHEME> env var override the token of the current request", async () => {
+  const definition: McpToolDefinition = {
+    ...emptyDefinition,
+    name: "get_thing",
+    method: "get",
+    pathTemplate: "/things/1",
+    securityRequirements: [{ bearerAuth: [] }],
+  }
+  const securitySchemes = { bearerAuth: { type: "http", scheme: "bearer" } }
+
+  let seenAuthorization: unknown
+  const httpClient = async (config: AxiosRequestConfig): Promise<AxiosResponse> => {
+    seenAuthorization = (config.headers ?? {})["authorization"]
+    return { data: { ok: true }, status: 200, statusText: "OK", headers: { "content-type": "application/json" }, config: {} as any }
+  }
+
+  const previous = process.env.BEARER_TOKEN_BEARERAUTH
+  process.env.BEARER_TOKEN_BEARERAUTH = "leftover-service-account-token"
+  try {
+    await requestBearerToken.run("pat-of-alice", async () => {
+      await executeApiTool("get_thing", definition, {}, securitySchemes, { httpClient, minIntervalMs: 0 })
+    })
+    assert.equal(seenAuthorization, "Bearer pat-of-alice", "a stale scheme-specific env var must never make a request act as somebody else")
+  } finally {
+    if (typeof previous === "undefined") delete process.env.BEARER_TOKEN_BEARERAUTH
+    else process.env.BEARER_TOKEN_BEARERAUTH = previous
+  }
+})
