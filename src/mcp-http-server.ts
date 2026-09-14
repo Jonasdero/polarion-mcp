@@ -7,11 +7,14 @@
  * you can add `https://your-host/mcp` as a connector URL.
  *
  * Security:
- * - A bearer token (`MCP_HTTP_TOKEN`) is **required**. The process refuses to
- *   start without it, and every `/mcp` request must send
- *   `Authorization: Bearer <MCP_HTTP_TOKEN>`.
- * - The Polarion credentials (`API_BASE_URL`, `BEARER_TOKEN`) stay server-side,
- *   exactly as in stdio mode.
+ * - The deployment holds **no Polarion credentials**. Every `/mcp` request must
+ *   send the caller's own Polarion Personal Access Token as
+ *   `Authorization: Bearer <polarion-pat>`; that token is used verbatim for the
+ *   upstream REST calls of that request, so Polarion itself authenticates and
+ *   authorizes every action under the real user.
+ * - Requests without a Bearer token are rejected with 401. An invalid token is
+ *   rejected by Polarion (401/403 surfaced back to the client).
+ * - Only `API_BASE_URL` is configured server-side.
  * - Optionally enable DNS-rebinding protection by setting `MCP_ALLOWED_HOSTS`.
  *
  * Sessions are stateful: each MCP `initialize` creates a transport (with its own
@@ -26,7 +29,7 @@ import dotenv from 'dotenv';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
 
-import { SERVER_NAME, SERVER_VERSION, API_BASE_URL } from './config.js';
+import { SERVER_NAME, SERVER_VERSION, API_BASE_URL, requestBearerToken } from './config.js';
 import { createPolarionServer } from './server.js';
 
 dotenv.config();
@@ -37,8 +40,6 @@ const MCP_PATH = '/mcp';
  * Options for {@link createMcpHttpApp}.
  */
 export interface McpHttpAppOptions {
-  /** Bearer token required on every `/mcp` request. */
-  token: string;
   /** Optional allow-list of Host header values enabling DNS-rebinding protection. */
   allowedHosts?: string[];
 }
@@ -62,11 +63,11 @@ function jsonRpcError(message: string) {
  * @param options - Bearer token and optional DNS-rebinding allow-list.
  * @returns The configured app and a session-cleanup function.
  */
-export function createMcpHttpApp(options: McpHttpAppOptions): {
+export function createMcpHttpApp(options: McpHttpAppOptions = {}): {
   app: express.Express;
   closeAllSessions: () => Promise<void>;
 } {
-  const { token, allowedHosts } = options;
+  const { allowedHosts } = options;
   const app = express();
   app.use(express.json({ limit: '10mb' }));
 
@@ -74,21 +75,27 @@ export function createMcpHttpApp(options: McpHttpAppOptions): {
   const transports: Record<string, StreamableHTTPServerTransport> = {};
 
   /**
-   * Rejects any `/mcp` request without a valid bearer token.
+   * Takes the caller's Polarion Personal Access Token from the `Authorization`
+   * header and makes it the token for everything this request triggers.
+   *
+   * The server keeps no credentials of its own, so a missing or malformed
+   * header is the only thing rejected here; whether the token is *valid* is
+   * Polarion's decision on the upstream call.
    *
    * @param req - Incoming request.
    * @param res - Outgoing response.
    * @param next - Next middleware in the chain.
-   * @returns Nothing; either calls `next()` or sends a 401.
+   * @returns Nothing; either runs the chain with the token bound or sends a 401.
    */
   const requireBearer = (req: Request, res: Response, next: NextFunction): void => {
     const header = req.get('authorization') ?? '';
-    const [scheme, value] = header.split(' ');
-    if (scheme !== 'Bearer' || value !== token) {
-      res.status(401).json(jsonRpcError('Unauthorized: valid Bearer token required'));
+    const [scheme, ...rest] = header.split(' ');
+    const value = rest.join(' ').trim();
+    if (scheme !== 'Bearer' || !value) {
+      res.status(401).json(jsonRpcError('Unauthorized: send your Polarion Personal Access Token as "Authorization: Bearer <token>"'));
       return;
     }
-    next();
+    requestBearerToken.run(value, next);
   };
 
   // Health check (no auth) for load balancers and quick verification.
@@ -172,30 +179,28 @@ export function createMcpHttpApp(options: McpHttpAppOptions): {
 /**
  * Starts the Streamable HTTP MCP server using environment configuration.
  *
- * Required env: `MCP_HTTP_TOKEN`. Optional: `MCP_HTTP_PORT` (or `HTTP_PORT`),
- * `MCP_ALLOWED_HOSTS` (comma-separated).
+ * Required env: `API_BASE_URL`. Optional: `MCP_HTTP_PORT` (or `HTTP_PORT`),
+ * `MCP_ALLOWED_HOSTS` (comma-separated). No credentials are read here — each
+ * client sends its own Polarion PAT.
  *
  * @returns The underlying Node HTTP server once it is listening.
  */
 export function startMcpHttpServer(): HttpServer {
-  const token = process.env.MCP_HTTP_TOKEN;
-  if (!token) {
-    console.error('[ERROR] MCP_HTTP_TOKEN is not set. The Streamable HTTP MCP server requires it.');
-    console.error('[ERROR] Generate one with: openssl rand -hex 32');
-    process.exit(1);
-  }
-
   const port = Number(process.env.MCP_HTTP_PORT || process.env.HTTP_PORT || 3000);
   const allowedHosts = (process.env.MCP_ALLOWED_HOSTS || '')
     .split(',')
     .map(h => h.trim())
     .filter(Boolean);
 
-  const { app, closeAllSessions } = createMcpHttpApp({ token, allowedHosts });
+  const { app, closeAllSessions } = createMcpHttpApp({ allowedHosts });
 
-  const httpServer = app.listen(port, () => {
+  // Behind a TLS reverse proxy, set MCP_HTTP_HOST=127.0.0.1 so the plaintext
+  // port — over which clients send their Polarion PAT — is never public.
+  const host = process.env.MCP_HTTP_HOST || '0.0.0.0';
+
+  const httpServer = app.listen(port, host, () => {
     console.log(`[INFO] ${SERVER_NAME} MCP Streamable HTTP server ${SERVER_VERSION} listening on port ${port}`);
-    console.log(`[INFO] MCP endpoint: http://localhost:${port}${MCP_PATH} (Bearer auth required)`);
+    console.log(`[INFO] MCP endpoint: http://localhost:${port}${MCP_PATH} (send your Polarion PAT as Bearer token)`);
     console.log(`[INFO] Health:       http://localhost:${port}/health`);
     console.log(`[INFO] Proxying Polarion API at ${API_BASE_URL}`);
     if (allowedHosts.length === 0) {

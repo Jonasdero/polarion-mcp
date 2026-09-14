@@ -13,6 +13,7 @@
  * - BEARER_TOKEN: Authentication token for API requests
  */
 
+import { AsyncLocalStorage } from 'node:async_hooks';
 import dotenv from 'dotenv';
 
 // Load environment variables from .env file
@@ -38,21 +39,31 @@ export const SERVER_VERSION = "v1";
 export const API_BASE_URL = process.env.API_BASE_URL || "https://polarion.example.com/polarion/rest/v1";
 
 /**
- * Get Bearer token from environment
+ * Per-request Polarion token, set by the Streamable HTTP transport.
  *
- * Bearer tokens are used for authentication with the Polarion REST API.
- * The token should be set in the BEARER_TOKEN environment variable.
+ * In HTTP mode every MCP client authenticates with its *own* Polarion Personal
+ * Access Token (`Authorization: Bearer <PAT>`), so the deployment itself holds
+ * no credentials. The token travels through the async call chain in this store
+ * instead of being threaded through every executor/guard signature.
+ */
+export const requestBearerToken = new AsyncLocalStorage<string>();
+
+/**
+ * Get the Bearer token for the current Polarion REST call.
+ *
+ * Resolution order:
+ * 1. The token of the MCP request currently being served (HTTP mode).
+ * 2. The `BEARER_TOKEN` environment variable (stdio mode, single-user setups).
  *
  * How to obtain a Bearer token:
  * 1. Log in to your Polarion instance
  * 2. Navigate to your user profile settings
  * 3. Generate a Personal Access Token (PAT)
- * 4. Set it as an environment variable: export BEARER_TOKEN="your-token-here"
  *
- * @returns The bearer token if set, undefined otherwise
+ * @returns The bearer token if available, undefined otherwise
  */
 export function getBearerToken(): string | undefined {
-  return process.env.BEARER_TOKEN;
+  return requestBearerToken.getStore() ?? process.env.BEARER_TOKEN;
 }
 
 /**
