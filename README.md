@@ -76,10 +76,19 @@ docker run -d \
   ghcr.io/phillipboesger/polarion-mcp:latest
 ```
 
-The HTTP deployment holds **no credentials**. Connect your MCP client to
-`http://localhost:3000/mcp` with `Authorization: Bearer <your Polarion PAT>`.
-That token is used for the Polarion REST calls of your own requests, so every
-user acts under their own Polarion account and permissions.
+The HTTP deployment holds **no credentials**. Two ways for a client to
+authenticate, both ending at the user's own Polarion Personal Access Token:
+
+- **Send the PAT yourself** — `Authorization: Bearer <your Polarion PAT>` on
+  `http://localhost:3000/mcp`. Right for curl and hand-configured clients.
+- **Log in** — set `MCP_PUBLIC_URL` to the server's public HTTPS URL and an
+  unauthenticated request answers with an OAuth challenge, so a client such as
+  a Claude.ai connector opens a page where the user pastes their PAT. The token
+  is checked against Polarion, kept in the server's memory for the session, and
+  never handed to the client or written to disk.
+
+Either way the Polarion REST calls of a request run with that user's own token,
+so everyone acts under their own Polarion account and permissions.
 
 <p align="center">
   <img src="docs/assets/demo-cloud.gif" alt="Polarion MCP running as a hosted HTTP MCP server, connected from Claude.ai" width="850">
@@ -141,6 +150,7 @@ BEARER_TOKEN=your_polarion_personal_access_token
 # Optional
 MCP_HTTP_PORT=3000                     # port for MCP HTTP server (default 3000)
 MCP_HTTP_HOST=127.0.0.1                # bind address (default 0.0.0.0); use loopback behind a TLS proxy
+MCP_PUBLIC_URL=https://mcp.example.com # public HTTPS base URL; enables the OAuth login page
 MCP_ALLOWED_HOSTS=your-host.com        # DNS-rebinding protection (comma-separated)
 NODE_TLS_REJECT_UNAUTHORIZED=0         # disable SSL verification for self-signed certs
 ```
