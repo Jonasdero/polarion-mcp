@@ -104,6 +104,11 @@ docker run --rm -i \
   node build/index.js
 ```
 
+To run it on the Polarion server itself, behind that server's own Apache
+(no Docker), follow [docs/deployment.md](docs/deployment.md) — it carries the
+systemd unit and the exact `ProxyPass` block, including the OAuth paths that
+are easy to forget.
+
 ### Local development
 
 ```bash
