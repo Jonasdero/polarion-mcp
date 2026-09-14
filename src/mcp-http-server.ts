@@ -29,8 +29,11 @@ import dotenv from 'dotenv';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
 
-import { SERVER_NAME, SERVER_VERSION, API_BASE_URL, requestBearerToken } from './config.js';
+import { mcpAuthRouter, getOAuthProtectedResourceMetadataUrl } from '@modelcontextprotocol/sdk/server/auth/router.js';
+
+import { SERVER_NAME, SERVER_VERSION, API_BASE_URL, requestBearerToken, getPolarionBaseUrl } from './config.js';
 import { createPolarionServer } from './server.js';
+import { PolarionOAuthProvider, renderLoginPage, LOGIN_PATH, POLARION_SCOPE } from './oauth.js';
 
 dotenv.config();
 
@@ -42,6 +45,15 @@ const MCP_PATH = '/mcp';
 export interface McpHttpAppOptions {
   /** Optional allow-list of Host header values enabling DNS-rebinding protection. */
   allowedHosts?: string[];
+  /**
+   * Public HTTPS base URL of this deployment. Setting it turns on the OAuth
+   * login flow, which is how clients that cannot be handed a token by hand
+   * (Claude.ai connectors) authenticate. Without it the server only accepts a
+   * Polarion PAT sent directly as the Bearer token.
+   */
+  publicUrl?: URL;
+  /** Token check used by the login page; injectable so tests need no Polarion. */
+  validateToken?: (token: string) => Promise<boolean>;
 }
 
 /**
@@ -67,20 +79,60 @@ export function createMcpHttpApp(options: McpHttpAppOptions = {}): {
   app: express.Express;
   closeAllSessions: () => Promise<void>;
 } {
-  const { allowedHosts } = options;
+  const { allowedHosts, publicUrl, validateToken } = options;
   const app = express();
   app.use(express.json({ limit: '10mb' }));
 
   // Active transports keyed by MCP session id.
   const transports: Record<string, StreamableHTTPServerTransport> = {};
 
+  // OAuth login, for clients that cannot be handed a token by hand.
+  const oauth = publicUrl ? new PolarionOAuthProvider(getPolarionBaseUrl(), validateToken) : undefined;
+  const resourceMetadataUrl = publicUrl ? getOAuthProtectedResourceMetadataUrl(new URL(MCP_PATH, publicUrl)) : undefined;
+
+  if (oauth && publicUrl) {
+    app.use(
+      mcpAuthRouter({
+        provider: oauth,
+        issuerUrl: publicUrl,
+        resourceServerUrl: new URL(MCP_PATH, publicUrl),
+        resourceName: SERVER_NAME,
+        scopesSupported: [POLARION_SCOPE],
+      })
+    );
+
+    // The login page posts here: check the pasted token, then hand the client
+    // back to its redirect URI.
+    app.post(LOGIN_PATH, express.urlencoded({ extended: false }), async (req: Request, res: Response) => {
+      const loginId = String(req.body?.login_id ?? '');
+      const token = String(req.body?.token ?? '');
+      const result = await oauth.completeLogin(loginId, token);
+      res.set('Cache-Control', 'no-store');
+      if (result.ok) {
+        res.redirect(302, result.redirectTo);
+        return;
+      }
+      if (result.pending) {
+        res.status(400).send(renderLoginPage(result.pending.loginId, getPolarionBaseUrl(), result.pending.clientName, result.reason));
+        return;
+      }
+      // No pending login left to retry into — the form would post into nothing.
+      res.status(400).type('text/plain').send(result.reason);
+    });
+  }
+
   /**
-   * Takes the caller's Polarion Personal Access Token from the `Authorization`
-   * header and makes it the token for everything this request triggers.
+   * Resolves the Polarion token for this request and binds it to the call chain.
    *
-   * The server keeps no credentials of its own, so a missing or malformed
-   * header is the only thing rejected here; whether the token is *valid* is
-   * Polarion's decision on the upstream call.
+   * Two ways in, both ending at one Polarion PAT:
+   * - a token this server issued through the OAuth login, which it maps back
+   *   to the PAT the user pasted, and
+   * - a Polarion PAT sent directly, for clients configured by hand (curl, VS
+   *   Code Copilot). The server keeps no credentials either way.
+   *
+   * A request without a Bearer token gets a 401 that points at this server's
+   * protected-resource metadata, which is what makes a client such as Claude.ai
+   * start the login flow instead of just failing.
    *
    * @param req - Incoming request.
    * @param res - Outgoing response.
@@ -92,10 +144,13 @@ export function createMcpHttpApp(options: McpHttpAppOptions = {}): {
     const [scheme, ...rest] = header.split(' ');
     const value = rest.join(' ').trim();
     if (scheme !== 'Bearer' || !value) {
-      res.status(401).json(jsonRpcError('Unauthorized: send your Polarion Personal Access Token as "Authorization: Bearer <token>"'));
+      if (resourceMetadataUrl) {
+        res.set('WWW-Authenticate', `Bearer resource_metadata="${resourceMetadataUrl}"`);
+      }
+      res.status(401).json(jsonRpcError('Unauthorized: log in, or send your Polarion Personal Access Token as "Authorization: Bearer <token>"'));
       return;
     }
-    requestBearerToken.run(value, next);
+    requestBearerToken.run(oauth?.polarionTokenFor(value) ?? value, next);
   };
 
   // Health check (no auth) for load balancers and quick verification.
@@ -179,9 +234,10 @@ export function createMcpHttpApp(options: McpHttpAppOptions = {}): {
 /**
  * Starts the Streamable HTTP MCP server using environment configuration.
  *
- * Required env: `API_BASE_URL`. Optional: `MCP_HTTP_PORT` (or `HTTP_PORT`),
+ * Required env: `API_BASE_URL`. Optional: `MCP_PUBLIC_URL` (enables the OAuth
+ * login flow), `MCP_HTTP_PORT` (or `HTTP_PORT`), `MCP_HTTP_HOST`,
  * `MCP_ALLOWED_HOSTS` (comma-separated). No credentials are read here — each
- * client sends its own Polarion PAT.
+ * client brings its own Polarion PAT.
  *
  * @returns The underlying Node HTTP server once it is listening.
  */
@@ -191,8 +247,9 @@ export function startMcpHttpServer(): HttpServer {
     .split(',')
     .map(h => h.trim())
     .filter(Boolean);
+  const publicUrl = process.env.MCP_PUBLIC_URL ? new URL(process.env.MCP_PUBLIC_URL) : undefined;
 
-  const { app, closeAllSessions } = createMcpHttpApp({ allowedHosts });
+  const { app, closeAllSessions } = createMcpHttpApp({ allowedHosts, publicUrl });
 
   // Behind a TLS reverse proxy, set MCP_HTTP_HOST=127.0.0.1 so the plaintext
   // port — over which clients send their Polarion PAT — is never public.
@@ -203,6 +260,11 @@ export function startMcpHttpServer(): HttpServer {
     console.log(`[INFO] MCP endpoint: http://localhost:${port}${MCP_PATH} (send your Polarion PAT as Bearer token)`);
     console.log(`[INFO] Health:       http://localhost:${port}/health`);
     console.log(`[INFO] Proxying Polarion API at ${API_BASE_URL}`);
+    if (publicUrl) {
+      console.log(`[INFO] OAuth login enabled at ${new URL('/authorize', publicUrl).href}`);
+    } else {
+      console.log('[WARN] MCP_PUBLIC_URL is not set: no OAuth login, clients must send a Polarion PAT themselves.');
+    }
     if (allowedHosts.length === 0) {
       console.log('[WARN] DNS-rebinding protection is OFF. Set MCP_ALLOWED_HOSTS to enable it.');
     }
